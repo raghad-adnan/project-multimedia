@@ -1,4 +1,5 @@
-﻿using NAudio.Wave;
+using NAudio.Wave;
+using NAudio.Wave.SampleProviders;
 using System;
 using System.IO;
 using System.Windows.Forms;
@@ -22,6 +23,19 @@ namespace AudioCompressionProject
         CancellationTokenSource cancellationTokenSource;
         Stopwatch stopwatch;
 
+        // Quantization step used for the residual of DPCM / Predictive coding.
+        // 16-bit residual -> signed 8-bit (1 byte) => ~50% size reduction.
+        const short ResidualStep = 256;
+
+        // Payload reported to the UI during compression so the live charts use
+        // REAL measured data instead of hard-coded constants.
+        private struct ProgressInfo
+        {
+            public int Percent;
+            public long InputBytes;   // input bytes consumed so far
+            public long OutputBytes;  // output bytes produced so far
+        }
+
         public Form1()
         {
             InitializeComponent();
@@ -36,6 +50,7 @@ namespace AudioCompressionProject
 
             this.DragEnter += Form1_DragEnter;
             this.DragDrop += Form1_DragDrop;
+            this.FormClosing += Form1_FormClosing;
 
             InitializeCharts();
             UpdateStatus("Ready");
@@ -49,7 +64,7 @@ namespace AudioCompressionProject
             // Increase groupbox height to accommodate new controls
             grpCompressionSettings.Height = 160;
 
-            // Create mu parameter control
+            // Create mu parameter control (Mu-law companding factor)
             Label lblMu = new Label();
             lblMu.Text = "Mu (μ):";
             lblMu.Location = new System.Drawing.Point(650, 30);
@@ -69,7 +84,7 @@ namespace AudioCompressionProject
             nudMu.Increment = 5;
             grpCompressionSettings.Controls.Add(nudMu);
 
-            // Create step parameter control
+            // Create step parameter control (Delta / ADM step, scaled for 16-bit audio)
             Label lblStep = new Label();
             lblStep.Text = "Step:";
             lblStep.Location = new System.Drawing.Point(650, 70);
@@ -84,9 +99,9 @@ namespace AudioCompressionProject
             nudStep.BackColor = System.Drawing.Color.FromArgb(40, 40, 40);
             nudStep.ForeColor = System.Drawing.Color.White;
             nudStep.Minimum = 1;
-            nudStep.Maximum = 64;
-            nudStep.Value = 16;
-            nudStep.Increment = 1;
+            nudStep.Maximum = 8000;
+            nudStep.Value = 512;
+            nudStep.Increment = 16;
             grpCompressionSettings.Controls.Add(nudStep);
 
             // Create minStep parameter control
@@ -104,9 +119,9 @@ namespace AudioCompressionProject
             nudMinStep.BackColor = System.Drawing.Color.FromArgb(40, 40, 40);
             nudMinStep.ForeColor = System.Drawing.Color.White;
             nudMinStep.Minimum = 1;
-            nudMinStep.Maximum = 32;
-            nudMinStep.Value = 4;
-            nudMinStep.Increment = 1;
+            nudMinStep.Maximum = 2000;
+            nudMinStep.Value = 64;
+            nudMinStep.Increment = 8;
             grpCompressionSettings.Controls.Add(nudMinStep);
 
             // Create maxStep parameter control
@@ -123,10 +138,10 @@ namespace AudioCompressionProject
             nudMaxStep.Size = new System.Drawing.Size(80, 25);
             nudMaxStep.BackColor = System.Drawing.Color.FromArgb(40, 40, 40);
             nudMaxStep.ForeColor = System.Drawing.Color.White;
-            nudMaxStep.Minimum = 16;
-            nudMaxStep.Maximum = 256;
-            nudMaxStep.Value = 128;
-            nudMaxStep.Increment = 8;
+            nudMaxStep.Minimum = 64;
+            nudMaxStep.Maximum = 16000;
+            nudMaxStep.Value = 4096;
+            nudMaxStep.Increment = 128;
             grpCompressionSettings.Controls.Add(nudMaxStep);
         }
 
@@ -139,11 +154,12 @@ namespace AudioCompressionProject
         private void btnBrowse_Click(object sender, EventArgs e)
         {
             OpenFileDialog ofd = new OpenFileDialog();
-            ofd.Filter = "Audio Files|*.wav;*.mp3";
+            ofd.Filter = "WAV Audio|*.wav";
 
             if (ofd.ShowDialog() == DialogResult.OK)
             {
                 currentFile = ofd.FileName;
+                listBoxFiles.Items.Clear();
                 listBoxFiles.Items.Add(currentFile);
                 ShowAudioProperties(currentFile);
             }
@@ -151,16 +167,27 @@ namespace AudioCompressionProject
 
         private void ShowAudioProperties(string file)
         {
-            FileInfo fi = new FileInfo(file);
-
-            using (var reader = new AudioFileReader(file))
+            try
             {
-                lblSize.Text = "Size: " + (fi.Length / 1024) + " KB";
-                lblDuration.Text = "Duration: " + reader.TotalTime.ToString();
-                lblSampleRate.Text = "Sample Rate: " + reader.WaveFormat.SampleRate;
-                lblChannels.Text = "Channels: " + reader.WaveFormat.Channels;
-                lblBitRate.Text = "Bit Rate: " + (reader.WaveFormat.BitsPerSample * reader.WaveFormat.SampleRate * reader.WaveFormat.Channels);
-                lblEncoding.Text = "Encoding: " + reader.WaveFormat.Encoding.ToString();
+                FileInfo fi = new FileInfo(file);
+
+                // Use WaveFileReader (not AudioFileReader) so the TRUE format is reported.
+                // AudioFileReader always converts to 32-bit IEEE float, which would make
+                // the encoding and bit-rate fields wrong.
+                using (var reader = new WaveFileReader(file))
+                {
+                    var f = reader.WaveFormat;
+                    lblSize.Text = "Size: " + FormatFileSize(fi.Length);
+                    lblDuration.Text = "Duration: " + reader.TotalTime.ToString(@"hh\:mm\:ss\.fff");
+                    lblSampleRate.Text = "Sample Rate: " + f.SampleRate + " Hz";
+                    lblChannels.Text = "Channels: " + f.Channels;
+                    lblBitRate.Text = "Bit Rate: " + (f.AverageBytesPerSecond * 8) + " bps";
+                    lblEncoding.Text = "Encoding: " + f.Encoding + " (" + f.BitsPerSample + "-bit)";
+                }
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show("Cannot read audio file: " + ex.Message);
             }
         }
 
@@ -168,27 +195,62 @@ namespace AudioCompressionProject
         {
             if (currentFile == "") return;
 
-            outputDevice = new WaveOutEvent();
-            audioFile = new AudioFileReader(currentFile);
-            outputDevice.Init(audioFile);
-            outputDevice.Play();
+            // Stop & dispose any existing playback first so repeated Play presses
+            // don't stack overlapping (and unstoppable) playback.
+            StopPlayback();
+
+            try
+            {
+                outputDevice = new WaveOutEvent();
+                audioFile = new AudioFileReader(currentFile);
+                outputDevice.Init(audioFile);
+                outputDevice.Play();
+            }
+            catch (Exception ex)
+            {
+                StopPlayback();
+                MessageBox.Show("Cannot play file: " + ex.Message);
+            }
         }
 
         private void btnStop_Click(object sender, EventArgs e)
         {
+            StopPlayback();
+        }
+
+        // Single point of teardown for playback. Stops the active device (if any)
+        // and releases both the device and the file handle.
+        private void StopPlayback()
+        {
             if (outputDevice != null)
+            {
                 outputDevice.Stop();
+                outputDevice.Dispose();
+                outputDevice = null;
+            }
+            if (audioFile != null)
+            {
+                audioFile.Dispose();
+                audioFile = null;
+            }
         }
 
         private async void btnCompress_Click(object sender, EventArgs e)
         {
-            if (currentFile == "") return;
+            if (currentFile == "")
+            {
+                MessageBox.Show("Load a WAV file first");
+                return;
+            }
 
             if (cmbAlgorithm.SelectedItem == null)
             {
                 MessageBox.Show("Select Algorithm");
                 return;
             }
+
+            // Release any playback handle so the input file is not locked.
+            StopPlayback();
 
             cancellationTokenSource = new CancellationTokenSource();
             stopwatch = new Stopwatch();
@@ -202,31 +264,33 @@ namespace AudioCompressionProject
 
             string algorithm = cmbAlgorithm.SelectedItem.ToString();
 
-            // Read compression parameters from UI controls
+            // Read compression settings from the UI controls.
+            int sampleRate = (int)nudSampleRate.Value;
+            int levels = (int)nudQuantizationLevels.Value;
+
             double mu = 255.0;
-            short step = 16;
-            short minStep = 4;
-            short maxStep = 128;
+            short step = 512;
+            short minStep = 64;
+            short maxStep = 4096;
 
-            // Get mu from nudMu control
             NumericUpDown nudMu = grpCompressionSettings.Controls.Find("nudMu", true).FirstOrDefault() as NumericUpDown;
-            if (nudMu != null)
-                mu = (double)nudMu.Value;
+            if (nudMu != null) mu = (double)nudMu.Value;
 
-            // Get step from nudStep control
             NumericUpDown nudStep = grpCompressionSettings.Controls.Find("nudStep", true).FirstOrDefault() as NumericUpDown;
-            if (nudStep != null)
-                step = (short)nudStep.Value;
+            if (nudStep != null) step = (short)nudStep.Value;
 
-            // Get minStep from nudMinStep control
             NumericUpDown nudMinStep = grpCompressionSettings.Controls.Find("nudMinStep", true).FirstOrDefault() as NumericUpDown;
-            if (nudMinStep != null)
-                minStep = (short)nudMinStep.Value;
+            if (nudMinStep != null) minStep = (short)nudMinStep.Value;
 
-            // Get maxStep from nudMaxStep control
             NumericUpDown nudMaxStep = grpCompressionSettings.Controls.Find("nudMaxStep", true).FirstOrDefault() as NumericUpDown;
-            if (nudMaxStep != null)
-                maxStep = (short)nudMaxStep.Value;
+            if (nudMaxStep != null) maxStep = (short)nudMaxStep.Value;
+
+            // Human-readable settings summary for the report.
+            string settings;
+            if (algorithm == "Nonlinear Quantization") settings = "mu=" + mu + ", levels=" + levels;
+            else if (algorithm == "Delta Modulation") settings = "step=" + step;
+            else if (algorithm == "Adaptive Delta Modulation") settings = "step=" + step + ", min=" + minStep + ", max=" + maxStep;
+            else settings = "2nd-order/8-bit residual";
 
             compressedFilePath =
                 Path.Combine(
@@ -235,11 +299,20 @@ namespace AudioCompressionProject
 
             try
             {
-                await Task.Run(() => CompressAudio(algorithm, compressedFilePath, cancellationTokenSource.Token, mu, step, minStep, maxStep));
+                // Normalize the input to 16-bit PCM WAV at the chosen sample rate.
+                // This is what wires the "Sample Rate" control into the pipeline and
+                // guarantees every algorithm receives clean 16-bit samples.
+                byte[] data = await Task.Run(() => PrepareInputData(currentFile, sampleRate));
+
+                int channels = data.Length >= 24 ? BitConverter.ToInt16(data, 22) : 1;
+                if (channels < 1) channels = 1;
+
+                await Task.Run(() => CompressAudio(data, algorithm, compressedFilePath,
+                    cancellationTokenSource.Token, mu, levels, step, minStep, maxStep));
 
                 if (!cancellationTokenSource.Token.IsCancellationRequested)
                 {
-                    CalculateAndDisplayStatistics(algorithm);
+                    CalculateAndDisplayStatistics(algorithm, settings, sampleRate, channels);
                     UpdateStatus("Completed");
                     btnSave.Enabled = true;
                     MessageBox.Show("Compression Completed");
@@ -266,47 +339,53 @@ namespace AudioCompressionProject
             }
         }
 
-        private void CompressAudio(string algorithm, string outputPath, CancellationToken token, double mu, short step, short minStep, short maxStep)
+        // Decode the input file and re-encode it as 16-bit PCM WAV at the target
+        // sample rate. Resampling only runs when the rate actually differs.
+        private byte[] PrepareInputData(string file, int targetSampleRate)
+        {
+            using (var reader = new AudioFileReader(file))
+            {
+                ISampleProvider source = reader;
+                if (reader.WaveFormat.SampleRate != targetSampleRate)
+                    source = new WdlResamplingSampleProvider(reader, targetSampleRate);
+
+                IWaveProvider pcm16 = source.ToWaveProvider16();
+                using (var ms = new MemoryStream())
+                {
+                    WaveFileWriter.WriteWavFileToStream(ms, pcm16);
+                    return ms.ToArray();
+                }
+            }
+        }
+
+        private void CompressAudio(byte[] data, string algorithm, string outputPath, CancellationToken token,
+                                   double mu, int levels, short step, short minStep, short maxStep)
         {
             stopwatch.Start();
+            long totalBytes = data.Length;
 
-            byte[] data = File.ReadAllBytes(currentFile);
-            int totalBytes = data.Length;
-
-            // Create progress callback for UI updates
-            Progress<int> progress = new Progress<int>(percent =>
+            // Real-time progress: ratio and speed are derived from the ACTUAL number
+            // of input/output bytes, not from per-algorithm constants.
+            Progress<ProgressInfo> progress = new Progress<ProgressInfo>(info =>
             {
-                UpdateProgress(percent);
-                
-                // Calculate and update compression ratio based on actual progress
-                double currentRatio = 0;
-                if (algorithm == "Nonlinear Quantization")
-                    currentRatio = 48.0 * (percent / 100.0);
-                else if (algorithm == "DPCM")
-                    currentRatio = 2.0 * (percent / 100.0);
-                else if (algorithm == "Delta Modulation")
-                    currentRatio = 85.0 * (percent / 100.0);
-                else if (algorithm == "Predictive Differential Coding")
-                    currentRatio = 1.5 * (percent / 100.0);
-                else if (algorithm == "Adaptive Delta Modulation")
-                    currentRatio = 85.0 * (percent / 100.0);
-                
-                UpdateCompressionChart(currentRatio);
-                
-                // Calculate processing speed
+                UpdateProgress(info.Percent);
+
+                double ratio = info.InputBytes > 0
+                    ? (1.0 - ((double)info.OutputBytes / info.InputBytes)) * 100.0
+                    : 0;
+                UpdateCompressionChart(ratio);
+
                 double elapsedSeconds = stopwatch.Elapsed.TotalSeconds;
                 if (elapsedSeconds > 0)
                 {
-                    double processedMB = (totalBytes * (percent / 100.0)) / (1024.0 * 1024.0);
-                    double speed = processedMB / elapsedSeconds;
-                    UpdateSpeedChart(speed);
+                    double processedMB = info.InputBytes / (1024.0 * 1024.0);
+                    UpdateSpeedChart(processedMB / elapsedSeconds);
                 }
             });
 
-            // الضغط الفعلي مع تمرير token و progress
             byte[] compressedData;
             if (algorithm == "Nonlinear Quantization")
-                compressedData = NonlinearQuantization(data, token, progress, mu);
+                compressedData = NonlinearQuantization(data, token, progress, mu, levels);
             else if (algorithm == "DPCM")
                 compressedData = DPCM(data, token, progress);
             else if (algorithm == "Delta Modulation")
@@ -318,11 +397,13 @@ namespace AudioCompressionProject
             else
                 compressedData = data;
 
-            // Check if compression was cancelled
+            // Cancelled mid-way -> do not write a partial file.
             if (compressedData == null)
+            {
+                stopwatch.Stop();
                 return;
+            }
 
-            // نرسم النسبة النهائية الحقيقية
             double finalRatio = ((double)(totalBytes - compressedData.Length) / totalBytes) * 100;
             UpdateCompressionChart(finalRatio);
             UpdateProgress(100);
@@ -331,7 +412,7 @@ namespace AudioCompressionProject
             stopwatch.Stop();
         }
 
-        private void CalculateAndDisplayStatistics(string algorithm)
+        private void CalculateAndDisplayStatistics(string algorithm, string settings, int sampleRate, int channels)
         {
             FileInfo originalInfo = new FileInfo(currentFile);
             FileInfo compressedInfo = new FileInfo(compressedFilePath);
@@ -342,14 +423,7 @@ namespace AudioCompressionProject
             long spaceSaved = originalSize - compressedSize;
             double processingTime = stopwatch.Elapsed.TotalSeconds;
 
-            string sampleRate = "-";
-            string bitRate = "-";
-
-            using (var reader = new AudioFileReader(currentFile))
-            {
-                sampleRate = reader.WaveFormat.SampleRate.ToString();
-                bitRate = (reader.WaveFormat.BitsPerSample * reader.WaveFormat.SampleRate * reader.WaveFormat.Channels).ToString();
-            }
+            int bitRate = 16 * sampleRate * channels;
 
             ShowFinalReport(
                 FormatFileSize(originalSize),
@@ -357,7 +431,7 @@ namespace AudioCompressionProject
                 compressionRatio.ToString("F2") + "%",
                 FormatFileSize(spaceSaved),
                 processingTime.ToString("F2") + " s",
-                algorithm,
+                algorithm + (string.IsNullOrEmpty(settings) ? "" : " (" + settings + ")"),
                 sampleRate + " Hz",
                 bitRate + " bps"
             );
@@ -365,12 +439,16 @@ namespace AudioCompressionProject
 
         private string FormatFileSize(long bytes)
         {
-            if (bytes < 1024)
-                return bytes + " B";
-            else if (bytes < 1024 * 1024)
-                return (bytes / 1024.0).ToString("F2") + " KB";
+            bool negative = bytes < 0;
+            long abs = Math.Abs(bytes);
+            string text;
+            if (abs < 1024)
+                text = abs + " B";
+            else if (abs < 1024 * 1024)
+                text = (abs / 1024.0).ToString("F2") + " KB";
             else
-                return (bytes / (1024.0 * 1024.0)).ToString("F2") + " MB";
+                text = (abs / (1024.0 * 1024.0)).ToString("F2") + " MB";
+            return negative ? "-" + text : text;
         }
 
         private void ShowFinalReport(
@@ -396,30 +474,28 @@ namespace AudioCompressionProject
 
         private void btnReset_Click(object sender, EventArgs e)
         {
+            StopPlayback();
+
             currentFile = "";
             compressedFilePath = "";
             listBoxFiles.Items.Clear();
 
             cmbAlgorithm.SelectedIndex = -1;
             nudSampleRate.Value = 44100;
-            nudQuantizationLevels.Value = 16;
+            nudQuantizationLevels.Value = 256;
 
             // Reset new parameter controls
             NumericUpDown nudMu = grpCompressionSettings.Controls.Find("nudMu", true).FirstOrDefault() as NumericUpDown;
-            if (nudMu != null)
-                nudMu.Value = 255;
+            if (nudMu != null) nudMu.Value = 255;
 
             NumericUpDown nudStep = grpCompressionSettings.Controls.Find("nudStep", true).FirstOrDefault() as NumericUpDown;
-            if (nudStep != null)
-                nudStep.Value = 16;
+            if (nudStep != null) nudStep.Value = 512;
 
             NumericUpDown nudMinStep = grpCompressionSettings.Controls.Find("nudMinStep", true).FirstOrDefault() as NumericUpDown;
-            if (nudMinStep != null)
-                nudMinStep.Value = 4;
+            if (nudMinStep != null) nudMinStep.Value = 64;
 
             NumericUpDown nudMaxStep = grpCompressionSettings.Controls.Find("nudMaxStep", true).FirstOrDefault() as NumericUpDown;
-            if (nudMaxStep != null)
-                nudMaxStep.Value = 128;
+            if (nudMaxStep != null) nudMaxStep.Value = 4096;
 
             progressCompression.Value = 0;
             lblProgressPercent.Text = "0%";
@@ -470,261 +546,308 @@ namespace AudioCompressionProject
         private void btnDecompress_Click(object sender, EventArgs e)
         {
             OpenFileDialog ofd = new OpenFileDialog();
-            ofd.Filter = "BIN Files|*.bin";
+            ofd.Filter = "Compressed Files|*.bin";
 
-            if (ofd.ShowDialog() == DialogResult.OK)
+            if (ofd.ShowDialog() != DialogResult.OK)
+                return;
+
+            string compressedFile = ofd.FileName;
+
+            try
             {
-                string compressedFile = ofd.FileName;
-
-                if (cmbAlgorithm.SelectedItem == null)
+                byte[] data = File.ReadAllBytes(compressedFile);
+                if (data.Length < 1)
                 {
-                    MessageBox.Show("Please select the decompression algorithm first");
+                    MessageBox.Show("Invalid compressed file");
                     return;
                 }
 
-                byte[] data = File.ReadAllBytes(compressedFile);
+                // The algorithm is identified by the first byte that was written at
+                // compression time -- we no longer depend on the ComboBox selection.
+                byte algoId = data[0];
                 byte[] decompressedData;
-                string algorithm = cmbAlgorithm.SelectedItem.ToString();
+                string usedAlgorithm;
 
-                if (algorithm == "Nonlinear Quantization")
-                    decompressedData = NonlinearQuantizationDecompress(data);
-                else if (algorithm == "DPCM")
-                    decompressedData = DPCMDecompress(data);
-                else if (algorithm == "Delta Modulation")
-                    decompressedData = DeltaModulationDecompress(data);
-                else if (algorithm == "Predictive Differential Coding")
-                    decompressedData = PredictiveDifferentialCodingDecompress(data);
-                else if (algorithm == "Adaptive Delta Modulation")
-                    decompressedData = AdaptiveDeltaModulationDecompress(data);
-                else
-                    decompressedData = data;
+                switch (algoId)
+                {
+                    case 0x01: decompressedData = NonlinearQuantizationDecompress(data); usedAlgorithm = "Nonlinear Quantization"; break;
+                    case 0x02: decompressedData = DPCMDecompress(data); usedAlgorithm = "DPCM"; break;
+                    case 0x03: decompressedData = DeltaModulationDecompress(data); usedAlgorithm = "Delta Modulation"; break;
+                    case 0x04: decompressedData = PredictiveDifferentialCodingDecompress(data); usedAlgorithm = "Predictive Differential Coding"; break;
+                    case 0x05: decompressedData = AdaptiveDeltaModulationDecompress(data); usedAlgorithm = "Adaptive Delta Modulation"; break;
+                    default:
+                        MessageBox.Show("Unrecognized algorithm ID in file. Was it produced by this app?");
+                        return;
+                }
 
-                string output = Path.Combine(Path.GetDirectoryName(compressedFile), "decompressed.wav");
+                string output = Path.Combine(
+                    Path.GetDirectoryName(compressedFile),
+                    Path.GetFileNameWithoutExtension(compressedFile) + "_decompressed.wav");
                 File.WriteAllBytes(output, decompressedData);
-                MessageBox.Show("Decompression Completed\nSaved to: " + output);
+                MessageBox.Show("Decompression Completed (" + usedAlgorithm + ")\nSaved to: " + output);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show("Decompression failed: " + ex.Message);
             }
         }
 
         // ============================================================
-        // ALGORITHM 1: Nonlinear Quantization (Mu-law)
-        // ضغط: يحول كل sample 16-bit -> 8-bit باستخدام mu-law
-        // النتيجة: ضغط 50% تقريباً
+        // Helpers
         // ============================================================
-        private byte[] NonlinearQuantization(byte[] data, CancellationToken token, IProgress<int> progress, double mu)
+
+        // Split a WAV byte buffer into its header (everything up to and including
+        // the "data" chunk descriptor) and the raw audio sample bytes.
+        private void SplitWav(byte[] data, out byte[] header, out byte[] audio)
         {
-            // Header: algorithm ID (1 byte) + original length (4 bytes)
-            // نشترط أن الملف WAV بـ 16-bit samples
-            // كل 2 bytes (sample) -> 1 byte مضغوط => توفير 50%
+            int headerSize = GetWavHeaderSize(data);
+            if (headerSize > data.Length) headerSize = data.Length;
+
+            header = new byte[headerSize];
+            Array.Copy(data, 0, header, 0, headerSize);
+
+            int audioLen = data.Length - headerSize;
+            audio = new byte[audioLen];
+            Array.Copy(data, headerSize, audio, 0, audioLen);
+        }
+
+        private byte[] Concat(byte[] header, byte[] audio)
+        {
+            byte[] result = new byte[header.Length + audio.Length];
+            Array.Copy(header, 0, result, 0, header.Length);
+            Array.Copy(audio, 0, result, header.Length, audio.Length);
+            return result;
+        }
+
+        private static short ClampShort(int value)
+        {
+            if (value > short.MaxValue) return short.MaxValue;
+            if (value < short.MinValue) return short.MinValue;
+            return (short)value;
+        }
+
+        // ============================================================
+        // ALGORITHM 1: Nonlinear Quantization (Mu-law companding)
+        // Each 16-bit sample -> 1 quantized byte  =>  ~50% size reduction.
+        // "levels" controls the number of quantization steps (quality).
+        // ============================================================
+        private byte[] NonlinearQuantization(byte[] data, CancellationToken token, IProgress<ProgressInfo> progress, double mu, int levels)
+        {
+            if (levels < 2) levels = 2;
+            if (levels > 256) levels = 256;
+            int maxIndex = levels - 1;
+
+            byte[] header, audio;
+            SplitWav(data, out header, out audio);
 
             List<byte> result = new List<byte>();
             result.Add(0x01); // Algorithm ID
-            result.AddRange(BitConverter.GetBytes(data.Length)); // original length
-            result.AddRange(BitConverter.GetBytes(mu)); // mu parameter
+            result.AddRange(BitConverter.GetBytes(header.Length));
+            result.AddRange(BitConverter.GetBytes(audio.Length));
+            result.AddRange(BitConverter.GetBytes(mu));
+            result.AddRange(BitConverter.GetBytes(levels));
+            result.AddRange(header);
 
-            int i = 0;
-            // نعالج أول 44 byte كـ WAV header بدون ضغط
-            int headerSize = Math.Min(44, data.Length);
-            for (i = 0; i < headerSize; i++)
-                result.Add(data[i]);
+            int sampleCount = audio.Length / 2;
+            int chunk = 4000;
 
-            // نضغط باقي البيانات: كل 2 bytes -> 1 byte
-            // Process in chunks for real-time progress updates
-            int chunkSize = 2000; // Process 1000 samples (2000 bytes) per chunk
-            int audioStart = headerSize;
-            int audioEnd = data.Length - (data.Length % 2);
-
-            for (i = audioStart; i + 1 < data.Length; i += chunkSize)
+            for (int i = 0; i < sampleCount; i += chunk)
             {
-                if (token.IsCancellationRequested)
-                    return null;
+                if (token.IsCancellationRequested) return null;
 
-                int chunkEnd = Math.Min(i + chunkSize, audioEnd);
-                for (int j = i; j + 1 < chunkEnd; j += 2)
+                int end = Math.Min(i + chunk, sampleCount);
+                for (int s = i; s < end; s++)
                 {
-                    short sample = BitConverter.ToInt16(data, j);
+                    short sample = BitConverter.ToInt16(audio, s * 2);
                     double normalized = sample / 32768.0;
-                    double compressed = Math.Sign(normalized) * (Math.Log(1 + mu * Math.Abs(normalized)) / Math.Log(1 + mu));
-                    byte quantized = (byte)((compressed * 127.5) + 127.5);
-                    result.Add(quantized);
+                    double companded = Math.Sign(normalized) * (Math.Log(1 + mu * Math.Abs(normalized)) / Math.Log(1 + mu));
+                    int q = (int)Math.Round(((companded + 1.0) / 2.0) * maxIndex);
+                    if (q < 0) q = 0;
+                    if (q > maxIndex) q = maxIndex;
+                    result.Add((byte)q);
                 }
 
-                // Report progress based on bytes processed
-                int processedBytes = chunkEnd;
-                int percent = (int)((processedBytes / (double)data.Length) * 100);
-                progress?.Report(percent);
+                progress?.Report(new ProgressInfo
+                {
+                    Percent = (int)(end / (double)sampleCount * 100),
+                    InputBytes = (long)header.Length + end * 2,
+                    OutputBytes = result.Count
+                });
             }
 
-            // Process remaining bytes
-            for (int j = i; j + 1 < data.Length; j += 2)
-            {
-                if (token.IsCancellationRequested)
-                    return null;
-
-                short sample = BitConverter.ToInt16(data, j);
-                double normalized = sample / 32768.0;
-                double compressed = Math.Sign(normalized) * (Math.Log(1 + mu * Math.Abs(normalized)) / Math.Log(1 + mu));
-                byte quantized = (byte)((compressed * 127.5) + 127.5);
-                result.Add(quantized);
-            }
-
-            // إذا بقي byte فردي
-            if (i < data.Length)
-                result.Add(data[i]);
-
-            progress?.Report(100);
+            progress?.Report(new ProgressInfo { Percent = 100, InputBytes = data.Length, OutputBytes = result.Count });
             return result.ToArray();
         }
 
         private byte[] NonlinearQuantizationDecompress(byte[] data)
         {
-            // تخطي algorithm ID
             int offset = 1;
-            int originalLength = BitConverter.ToInt32(data, offset); offset += 4;
+            int headerSize = BitConverter.ToInt32(data, offset); offset += 4;
+            int audioLen = BitConverter.ToInt32(data, offset); offset += 4;
             double mu = BitConverter.ToDouble(data, offset); offset += 8;
-            List<byte> result = new List<byte>();
+            int levels = BitConverter.ToInt32(data, offset); offset += 4;
+            if (levels < 2) levels = 2;
+            int maxIndex = levels - 1;
 
-            int headerSize = Math.Min(44, originalLength);
+            byte[] header = new byte[headerSize];
+            Array.Copy(data, offset, header, 0, headerSize); offset += headerSize;
 
-            // استرجاع WAV header
-            for (int j = offset; j < offset + headerSize && j < data.Length; j++)
-                result.Add(data[j]);
-            offset += headerSize;
+            int sampleCount = audioLen / 2;
+            List<byte> audio = new List<byte>(audioLen);
 
-            // فك الضغط: كل 1 byte -> 2 bytes
-            for (int i = offset; i < data.Length && result.Count < originalLength; i++)
+            for (int s = 0; s < sampleCount && offset < data.Length; s++, offset++)
             {
-                byte quantized = data[i];
-                double normalized = (quantized - 127.5) / 127.5;
-                double decompressed = Math.Sign(normalized) * ((1.0 / mu) * (Math.Pow(1 + mu, Math.Abs(normalized)) - 1));
-                short sample = (short)(decompressed * 32768.0);
-                byte[] sampleBytes = BitConverter.GetBytes(sample);
-                result.Add(sampleBytes[0]);
-                if (result.Count < originalLength)
-                    result.Add(sampleBytes[1]);
+                int q = data[offset];
+                double companded = ((double)q / maxIndex) * 2.0 - 1.0;
+                double normalized = Math.Sign(companded) * (1.0 / mu) * (Math.Pow(1 + mu, Math.Abs(companded)) - 1.0);
+                short sample = ClampShort((int)Math.Round(normalized * 32768.0));
+                audio.AddRange(BitConverter.GetBytes(sample));
             }
 
-            return result.ToArray();
+            return Concat(header, audio.ToArray());
         }
 
         // ============================================================
-        // ALGORITHM 2: DPCM - هذا يشتغل صح، بس أضفنا Algorithm ID
+        // ALGORITHM 2: DPCM (1st-order predictor, quantized residual)
+        // First sample stored verbatim; each later sample stored as an 8-bit
+        // quantized difference  =>  ~50% size reduction (lossy).
+        // The predictor uses the RECONSTRUCTED value to avoid drift.
         // ============================================================
-        private byte[] DPCM(byte[] data, CancellationToken token, IProgress<int> progress)
+        private byte[] DPCM(byte[] data, CancellationToken token, IProgress<ProgressInfo> progress)
         {
+            short qstep = ResidualStep;
+
+            byte[] header, audio;
+            SplitWav(data, out header, out audio);
+
             List<byte> result = new List<byte>();
             result.Add(0x02); // Algorithm ID
-            result.AddRange(BitConverter.GetBytes(data.Length));
-            result.Add(data[0]);
+            result.AddRange(BitConverter.GetBytes(header.Length));
+            result.AddRange(BitConverter.GetBytes(audio.Length));
+            result.AddRange(BitConverter.GetBytes(qstep));
+            result.AddRange(header);
 
-            // Process in chunks for real-time progress updates
-            int chunkSize = 10000;
-
-            for (int i = 1; i < data.Length; i += chunkSize)
+            int sampleCount = audio.Length / 2;
+            if (sampleCount == 0)
             {
-                if (token.IsCancellationRequested)
-                    return null;
-
-                int chunkEnd = Math.Min(i + chunkSize, data.Length);
-                for (int j = i; j < chunkEnd; j++)
-                {
-                    sbyte diff = (sbyte)(data[j] - data[j - 1]);
-                    result.Add((byte)diff);
-                }
-
-                // Report progress based on bytes processed
-                int percent = (int)((chunkEnd / (double)data.Length) * 100);
-                progress?.Report(percent);
+                progress?.Report(new ProgressInfo { Percent = 100, InputBytes = data.Length, OutputBytes = result.Count });
+                return result.ToArray();
             }
 
-            progress?.Report(100);
+            short prev = BitConverter.ToInt16(audio, 0);
+            result.AddRange(BitConverter.GetBytes(prev)); // first sample verbatim
+
+            int chunk = 4000;
+            for (int i = 1; i < sampleCount; i += chunk)
+            {
+                if (token.IsCancellationRequested) return null;
+
+                int end = Math.Min(i + chunk, sampleCount);
+                for (int s = i; s < end; s++)
+                {
+                    short sample = BitConverter.ToInt16(audio, s * 2);
+                    int diff = sample - prev;
+                    int r = (int)Math.Round(diff / (double)qstep);
+                    if (r < -128) r = -128;
+                    if (r > 127) r = 127;
+                    result.Add((byte)(sbyte)r);
+                    prev = ClampShort(prev + r * qstep);
+                }
+
+                progress?.Report(new ProgressInfo
+                {
+                    Percent = (int)(end / (double)sampleCount * 100),
+                    InputBytes = (long)header.Length + end * 2,
+                    OutputBytes = result.Count
+                });
+            }
+
+            progress?.Report(new ProgressInfo { Percent = 100, InputBytes = data.Length, OutputBytes = result.Count });
             return result.ToArray();
         }
 
         private byte[] DPCMDecompress(byte[] data)
         {
-            // Skip algorithm ID (1 byte)
-            int originalLength = BitConverter.ToInt32(data, 1);
-            byte prev = data[5];
-            List<byte> result = new List<byte>();
+            int offset = 1;
+            int headerSize = BitConverter.ToInt32(data, offset); offset += 4;
+            int audioLen = BitConverter.ToInt32(data, offset); offset += 4;
+            short qstep = BitConverter.ToInt16(data, offset); offset += 2;
 
-            result.Add(prev);
+            byte[] header = new byte[headerSize];
+            Array.Copy(data, offset, header, 0, headerSize); offset += headerSize;
 
-            for (int i = 6; i < data.Length && result.Count < originalLength; i++)
+            int sampleCount = audioLen / 2;
+            List<byte> audio = new List<byte>(audioLen);
+            if (sampleCount == 0)
+                return Concat(header, audio.ToArray());
+
+            short prev = BitConverter.ToInt16(data, offset); offset += 2;
+            audio.AddRange(BitConverter.GetBytes(prev));
+
+            for (int s = 1; s < sampleCount && offset < data.Length; s++, offset++)
             {
-                sbyte diff = (sbyte)data[i];
-                byte current = (byte)(prev + diff);
-                result.Add(current);
-                prev = current;
+                sbyte r = (sbyte)data[offset];
+                prev = ClampShort(prev + r * qstep);
+                audio.AddRange(BitConverter.GetBytes(prev));
             }
 
-            return result.ToArray();
+            return Concat(header, audio.ToArray());
         }
 
         // ============================================================
-        // ALGORITHM 3: Delta Modulation
-        // WAV header محفوظ كما هو، نضغط فقط audio data
-        // 8 samples -> 1 byte (كل sample يصير 1 bit)
+        // ALGORITHM 3: Delta Modulation (1 bit per 16-bit sample)
+        // First sample stored verbatim; every later sample -> 1 bit  =>  ~94%.
         // ============================================================
-        private byte[] DeltaModulation(byte[] data, CancellationToken token, IProgress<int> progress, short step)
+        private byte[] DeltaModulation(byte[] data, CancellationToken token, IProgress<ProgressInfo> progress, short step)
         {
-            // نقرأ WAV header size (عادة 44 byte، بس نقرأها صح من الـ header)
-            int headerSize = GetWavHeaderSize(data);
-            byte[] header = new byte[headerSize];
-            Array.Copy(data, 0, header, 0, headerSize);
+            if (step < 1) step = 1;
 
-            byte[] audioData = new byte[data.Length - headerSize];
-            Array.Copy(data, headerSize, audioData, 0, audioData.Length);
+            byte[] header, audio;
+            SplitWav(data, out header, out audio);
 
             List<byte> result = new List<byte>();
-            // Header: AlgorithmID(1) + headerSize(4) + originalAudioLength(4) + step(2)
-            result.Add(0x03);
-            result.AddRange(BitConverter.GetBytes(headerSize));
-            result.AddRange(BitConverter.GetBytes(audioData.Length));
+            result.Add(0x03); // Algorithm ID
+            result.AddRange(BitConverter.GetBytes(header.Length));
+            result.AddRange(BitConverter.GetBytes(audio.Length));
             result.AddRange(BitConverter.GetBytes(step));
-            // حفظ WAV header كاملاً
             result.AddRange(header);
 
-            if (audioData.Length == 0)
+            int sampleCount = audio.Length / 2;
+            if (sampleCount == 0)
             {
-                progress?.Report(100);
+                progress?.Report(new ProgressInfo { Percent = 100, InputBytes = data.Length, OutputBytes = result.Count });
                 return result.ToArray();
             }
 
-            byte predicted = audioData[0];
+            short predicted = BitConverter.ToInt16(audio, 0);
+            result.AddRange(BitConverter.GetBytes(predicted)); // first sample verbatim
+
             int bitBuffer = 0;
             int bitCount = 0;
+            int chunk = 8000;
 
-            // أول sample نحفظه كما هو
-            result.Add(audioData[0]);
-
-            // Process in chunks for real-time progress updates
-            int chunkSize = 8000; // Process 8000 samples per chunk
-
-            for (int i = 1; i < audioData.Length; i += chunkSize)
+            for (int i = 1; i < sampleCount; i += chunk)
             {
-                if (token.IsCancellationRequested)
-                    return null;
+                if (token.IsCancellationRequested) return null;
 
-                int chunkEnd = Math.Min(i + chunkSize, audioData.Length);
-                for (int j = i; j < chunkEnd; j++)
+                int end = Math.Min(i + chunk, sampleCount);
+                for (int s = i; s < end; s++)
                 {
-                    byte actual = audioData[j];
+                    short sample = BitConverter.ToInt16(audio, s * 2);
                     int bit;
-
-                    if (actual >= predicted)
+                    if (sample >= predicted)
                     {
                         bit = 1;
-                        predicted = (byte)Math.Min(255, predicted + step);
+                        predicted = ClampShort(predicted + step);
                     }
                     else
                     {
                         bit = 0;
-                        predicted = (byte)Math.Max(0, predicted - step);
+                        predicted = ClampShort(predicted - step);
                     }
 
                     bitBuffer = (bitBuffer << 1) | bit;
                     bitCount++;
-
                     if (bitCount == 8)
                     {
                         result.Add((byte)bitBuffer);
@@ -733,9 +856,12 @@ namespace AudioCompressionProject
                     }
                 }
 
-                // Report progress based on bytes processed
-                int percent = (int)((chunkEnd / (double)audioData.Length) * 100);
-                progress?.Report(percent);
+                progress?.Report(new ProgressInfo
+                {
+                    Percent = (int)(end / (double)sampleCount * 100),
+                    InputBytes = (long)header.Length + end * 2,
+                    OutputBytes = result.Count
+                });
             }
 
             if (bitCount > 0)
@@ -744,7 +870,7 @@ namespace AudioCompressionProject
                 result.Add((byte)bitBuffer);
             }
 
-            progress?.Report(100);
+            progress?.Report(new ProgressInfo { Percent = 100, InputBytes = data.Length, OutputBytes = result.Count });
             return result.ToArray();
         }
 
@@ -752,95 +878,104 @@ namespace AudioCompressionProject
         {
             int offset = 1;
             int headerSize = BitConverter.ToInt32(data, offset); offset += 4;
-            int origAudioLength = BitConverter.ToInt32(data, offset); offset += 4;
+            int audioLen = BitConverter.ToInt32(data, offset); offset += 4;
             short step = BitConverter.ToInt16(data, offset); offset += 2;
 
-            // استرجاع WAV header
             byte[] header = new byte[headerSize];
-            Array.Copy(data, offset, header, 0, headerSize);
-            offset += headerSize;
+            Array.Copy(data, offset, header, 0, headerSize); offset += headerSize;
 
-            List<byte> audioResult = new List<byte>();
+            int sampleCount = audioLen / 2;
+            List<byte> audio = new List<byte>(audioLen);
+            if (sampleCount == 0)
+                return Concat(header, audio.ToArray());
 
-            // أول sample
-            byte predicted = data[offset];
-            audioResult.Add(predicted);
-            offset++;
+            short predicted = BitConverter.ToInt16(data, offset); offset += 2;
+            audio.AddRange(BitConverter.GetBytes(predicted));
+            int produced = 1;
 
-            // فك باقي البيانات
-            for (int i = offset; i < data.Length && audioResult.Count < origAudioLength; i++)
+            for (int i = offset; i < data.Length && produced < sampleCount; i++)
             {
                 byte byteVal = data[i];
-                for (int bit = 7; bit >= 0 && audioResult.Count < origAudioLength; bit--)
+                for (int bit = 7; bit >= 0 && produced < sampleCount; bit--)
                 {
                     int b = (byteVal >> bit) & 1;
                     if (b == 1)
-                        predicted = (byte)Math.Min(255, predicted + step);
+                        predicted = ClampShort(predicted + step);
                     else
-                        predicted = (byte)Math.Max(0, predicted - step);
-                    audioResult.Add(predicted);
+                        predicted = ClampShort(predicted - step);
+                    audio.AddRange(BitConverter.GetBytes(predicted));
+                    produced++;
                 }
             }
 
-            // نجمع WAV header + audio data
-            byte[] finalResult = new byte[headerSize + audioResult.Count];
-            Array.Copy(header, 0, finalResult, 0, headerSize);
-            Array.Copy(audioResult.ToArray(), 0, finalResult, headerSize, audioResult.Count);
-            return finalResult;
+            return Concat(header, audio.ToArray());
         }
 
         // ============================================================
         // ALGORITHM 4: Predictive Differential Coding
-        // WAV header محفوظ كما هو، نضغط فقط audio data
+        // 2nd-order linear predictor (2*p1 - p2), residual quantized to 8 bits
+        // =>  ~50% size reduction (lossy). Predictor uses reconstructed samples.
         // ============================================================
-        private byte[] PredictiveDifferentialCoding(byte[] data, CancellationToken token, IProgress<int> progress)
+        private byte[] PredictiveDifferentialCoding(byte[] data, CancellationToken token, IProgress<ProgressInfo> progress)
         {
-            int headerSize = GetWavHeaderSize(data);
-            byte[] header = new byte[headerSize];
-            Array.Copy(data, 0, header, 0, headerSize);
+            short qstep = ResidualStep;
 
-            byte[] audioData = new byte[data.Length - headerSize];
-            Array.Copy(data, headerSize, audioData, 0, audioData.Length);
+            byte[] header, audio;
+            SplitWav(data, out header, out audio);
 
             List<byte> result = new List<byte>();
-            // Header: AlgorithmID(1) + headerSize(4) + originalAudioLength(4)
-            result.Add(0x04);
-            result.AddRange(BitConverter.GetBytes(headerSize));
-            result.AddRange(BitConverter.GetBytes(audioData.Length));
+            result.Add(0x04); // Algorithm ID
+            result.AddRange(BitConverter.GetBytes(header.Length));
+            result.AddRange(BitConverter.GetBytes(audio.Length));
+            result.AddRange(BitConverter.GetBytes(qstep));
             result.AddRange(header);
 
-            if (audioData.Length == 0)
+            int sampleCount = audio.Length / 2;
+            if (sampleCount == 0)
             {
-                progress?.Report(100);
+                progress?.Report(new ProgressInfo { Percent = 100, InputBytes = data.Length, OutputBytes = result.Count });
                 return result.ToArray();
             }
 
-            result.Add(audioData[0]);
-            if (audioData.Length > 1) result.Add(audioData[1]);
+            short prev2 = BitConverter.ToInt16(audio, 0);
+            result.AddRange(BitConverter.GetBytes(prev2));
+            short prev1 = prev2;
 
-            // Process in chunks for real-time progress updates
-            int chunkSize = 10000;
-
-            for (int i = 2; i < audioData.Length; i += chunkSize)
+            if (sampleCount > 1)
             {
-                if (token.IsCancellationRequested)
-                    return null;
-
-                int chunkEnd = Math.Min(i + chunkSize, audioData.Length);
-                for (int j = i; j < chunkEnd; j++)
-                {
-                    int prediction = (2 * audioData[j - 1]) - audioData[j - 2];
-                    prediction = Math.Max(0, Math.Min(255, prediction));
-                    sbyte error = (sbyte)(audioData[j] - prediction);
-                    result.Add((byte)error);
-                }
-
-                // Report progress based on bytes processed
-                int percent = (int)((chunkEnd / (double)audioData.Length) * 100);
-                progress?.Report(percent);
+                prev1 = BitConverter.ToInt16(audio, 2);
+                result.AddRange(BitConverter.GetBytes(prev1));
             }
 
-            progress?.Report(100);
+            int chunk = 4000;
+            for (int i = 2; i < sampleCount; i += chunk)
+            {
+                if (token.IsCancellationRequested) return null;
+
+                int end = Math.Min(i + chunk, sampleCount);
+                for (int s = i; s < end; s++)
+                {
+                    short sample = BitConverter.ToInt16(audio, s * 2);
+                    int prediction = ClampShort(2 * prev1 - prev2);
+                    int error = sample - prediction;
+                    int r = (int)Math.Round(error / (double)qstep);
+                    if (r < -128) r = -128;
+                    if (r > 127) r = 127;
+                    result.Add((byte)(sbyte)r);
+                    short recon = ClampShort(prediction + r * qstep);
+                    prev2 = prev1;
+                    prev1 = recon;
+                }
+
+                progress?.Report(new ProgressInfo
+                {
+                    Percent = (int)(end / (double)sampleCount * 100),
+                    InputBytes = (long)header.Length + end * 2,
+                    OutputBytes = result.Count
+                });
+            }
+
+            progress?.Report(new ProgressInfo { Percent = 100, InputBytes = data.Length, OutputBytes = result.Count });
             return result.ToArray();
         }
 
@@ -848,106 +983,109 @@ namespace AudioCompressionProject
         {
             int offset = 1;
             int headerSize = BitConverter.ToInt32(data, offset); offset += 4;
-            int origAudioLength = BitConverter.ToInt32(data, offset); offset += 4;
+            int audioLen = BitConverter.ToInt32(data, offset); offset += 4;
+            short qstep = BitConverter.ToInt16(data, offset); offset += 2;
 
             byte[] header = new byte[headerSize];
-            Array.Copy(data, offset, header, 0, headerSize);
-            offset += headerSize;
+            Array.Copy(data, offset, header, 0, headerSize); offset += headerSize;
 
-            List<byte> audioResult = new List<byte>();
+            int sampleCount = audioLen / 2;
+            List<byte> audio = new List<byte>(audioLen);
+            if (sampleCount == 0)
+                return Concat(header, audio.ToArray());
 
-            byte prev2 = data[offset]; audioResult.Add(prev2); offset++;
-            byte prev1 = (origAudioLength > 1) ? data[offset] : prev2;
-            if (origAudioLength > 1) { audioResult.Add(prev1); offset++; }
+            short prev2 = BitConverter.ToInt16(data, offset); offset += 2;
+            audio.AddRange(BitConverter.GetBytes(prev2));
+            int produced = 1;
+            short prev1 = prev2;
 
-            for (int i = offset; i < data.Length && audioResult.Count < origAudioLength; i++)
+            if (sampleCount > 1)
             {
-                sbyte error = (sbyte)data[i];
-                int prediction = (2 * prev1) - prev2;
-                prediction = Math.Max(0, Math.Min(255, prediction));
-                byte current = (byte)(prediction + error);
-                audioResult.Add(current);
-                prev2 = prev1;
-                prev1 = current;
+                prev1 = BitConverter.ToInt16(data, offset); offset += 2;
+                audio.AddRange(BitConverter.GetBytes(prev1));
+                produced = 2;
             }
 
-            byte[] finalResult = new byte[headerSize + audioResult.Count];
-            Array.Copy(header, 0, finalResult, 0, headerSize);
-            Array.Copy(audioResult.ToArray(), 0, finalResult, headerSize, audioResult.Count);
-            return finalResult;
+            for (int i = offset; i < data.Length && produced < sampleCount; i++, produced++)
+            {
+                sbyte r = (sbyte)data[i];
+                int prediction = ClampShort(2 * prev1 - prev2);
+                short recon = ClampShort(prediction + r * qstep);
+                audio.AddRange(BitConverter.GetBytes(recon));
+                prev2 = prev1;
+                prev1 = recon;
+            }
+
+            return Concat(header, audio.ToArray());
         }
 
         // ============================================================
-        // ALGORITHM 5: Adaptive Delta Modulation
-        // WAV header محفوظ كما هو، نضغط فقط audio data
+        // ALGORITHM 5: Adaptive Delta Modulation (1 adaptive bit per sample)
+        // Like Delta Modulation but the step doubles/halves between
+        // minStep and maxStep to track the signal  =>  ~94% size reduction.
         // ============================================================
-        private byte[] AdaptiveDeltaModulation(byte[] data, CancellationToken token, IProgress<int> progress, short step, short minStep, short maxStep)
+        private byte[] AdaptiveDeltaModulation(byte[] data, CancellationToken token, IProgress<ProgressInfo> progress, short step, short minStep, short maxStep)
         {
-            int headerSize = GetWavHeaderSize(data);
-            byte[] header = new byte[headerSize];
-            Array.Copy(data, 0, header, 0, headerSize);
+            if (step < 1) step = 1;
+            if (minStep < 1) minStep = 1;
+            if (maxStep < minStep) maxStep = minStep;
 
-            byte[] audioData = new byte[data.Length - headerSize];
-            Array.Copy(data, headerSize, audioData, 0, audioData.Length);
+            byte[] header, audio;
+            SplitWav(data, out header, out audio);
 
             List<byte> result = new List<byte>();
-            // Header: AlgorithmID(1) + headerSize(4) + originalAudioLength(4) + step(2) + minStep(2) + maxStep(2)
-            result.Add(0x05);
-            result.AddRange(BitConverter.GetBytes(headerSize));
-            result.AddRange(BitConverter.GetBytes(audioData.Length));
+            result.Add(0x05); // Algorithm ID
+            result.AddRange(BitConverter.GetBytes(header.Length));
+            result.AddRange(BitConverter.GetBytes(audio.Length));
             result.AddRange(BitConverter.GetBytes(step));
             result.AddRange(BitConverter.GetBytes(minStep));
             result.AddRange(BitConverter.GetBytes(maxStep));
             result.AddRange(header);
 
-            if (audioData.Length == 0)
+            int sampleCount = audio.Length / 2;
+            if (sampleCount == 0)
             {
-                progress?.Report(100);
+                progress?.Report(new ProgressInfo { Percent = 100, InputBytes = data.Length, OutputBytes = result.Count });
                 return result.ToArray();
             }
 
-            byte predicted = audioData[0];
-            result.Add(audioData[0]);
+            short predicted = BitConverter.ToInt16(audio, 0);
+            result.AddRange(BitConverter.GetBytes(predicted)); // first sample verbatim
 
+            int curStep = step;
             int bitBuffer = 0;
             int bitCount = 0;
             int previousBit = 0;
+            int chunk = 8000;
 
-            // Process in chunks for real-time progress updates
-            int chunkSize = 8000; // Process 8000 samples per chunk
-
-            for (int i = 1; i < audioData.Length; i += chunkSize)
+            for (int i = 1; i < sampleCount; i += chunk)
             {
-                if (token.IsCancellationRequested)
-                    return null;
+                if (token.IsCancellationRequested) return null;
 
-                int chunkEnd = Math.Min(i + chunkSize, audioData.Length);
-                for (int j = i; j < chunkEnd; j++)
+                int end = Math.Min(i + chunk, sampleCount);
+                for (int s = i; s < end; s++)
                 {
-                    byte actual = audioData[j];
+                    short sample = BitConverter.ToInt16(audio, s * 2);
                     int bit;
-
-                    if (actual >= predicted)
+                    if (sample >= predicted)
                     {
                         bit = 1;
-                        predicted = (byte)Math.Min(255, predicted + step);
+                        predicted = ClampShort(predicted + curStep);
                     }
                     else
                     {
                         bit = 0;
-                        predicted = (byte)Math.Max(0, predicted - step);
+                        predicted = ClampShort(predicted - curStep);
                     }
 
                     if (bit == previousBit)
-                        step = (short)Math.Min(maxStep, step * 2);
+                        curStep = Math.Min(maxStep, curStep * 2);
                     else
-                        step = (short)Math.Max(minStep, step / 2);
-
+                        curStep = Math.Max(minStep, curStep / 2);
                     previousBit = bit;
 
                     bitBuffer = (bitBuffer << 1) | bit;
                     bitCount++;
-
                     if (bitCount == 8)
                     {
                         result.Add((byte)bitBuffer);
@@ -956,9 +1094,12 @@ namespace AudioCompressionProject
                     }
                 }
 
-                // Report progress based on bytes processed
-                int percent = (int)((chunkEnd / (double)audioData.Length) * 100);
-                progress?.Report(percent);
+                progress?.Report(new ProgressInfo
+                {
+                    Percent = (int)(end / (double)sampleCount * 100),
+                    InputBytes = (long)header.Length + end * 2,
+                    OutputBytes = result.Count
+                });
             }
 
             if (bitCount > 0)
@@ -967,7 +1108,7 @@ namespace AudioCompressionProject
                 result.Add((byte)bitBuffer);
             }
 
-            progress?.Report(100);
+            progress?.Report(new ProgressInfo { Percent = 100, InputBytes = data.Length, OutputBytes = result.Count });
             return result.ToArray();
         }
 
@@ -975,74 +1116,71 @@ namespace AudioCompressionProject
         {
             int offset = 1;
             int headerSize = BitConverter.ToInt32(data, offset); offset += 4;
-            int origAudioLength = BitConverter.ToInt32(data, offset); offset += 4;
+            int audioLen = BitConverter.ToInt32(data, offset); offset += 4;
             short step = BitConverter.ToInt16(data, offset); offset += 2;
             short minStep = BitConverter.ToInt16(data, offset); offset += 2;
             short maxStep = BitConverter.ToInt16(data, offset); offset += 2;
 
             byte[] header = new byte[headerSize];
-            Array.Copy(data, offset, header, 0, headerSize);
-            offset += headerSize;
+            Array.Copy(data, offset, header, 0, headerSize); offset += headerSize;
 
-            List<byte> audioResult = new List<byte>();
+            int sampleCount = audioLen / 2;
+            List<byte> audio = new List<byte>(audioLen);
+            if (sampleCount == 0)
+                return Concat(header, audio.ToArray());
 
-            byte predicted = data[offset];
-            audioResult.Add(predicted);
-            offset++;
+            short predicted = BitConverter.ToInt16(data, offset); offset += 2;
+            audio.AddRange(BitConverter.GetBytes(predicted));
+            int produced = 1;
 
+            int curStep = step;
             int previousBit = 0;
 
-            for (int i = offset; i < data.Length && audioResult.Count < origAudioLength; i++)
+            for (int i = offset; i < data.Length && produced < sampleCount; i++)
             {
                 byte byteVal = data[i];
-                for (int bitPos = 7; bitPos >= 0 && audioResult.Count < origAudioLength; bitPos--)
+                for (int bitPos = 7; bitPos >= 0 && produced < sampleCount; bitPos--)
                 {
                     int bit = (byteVal >> bitPos) & 1;
 
                     if (bit == 1)
-                        predicted = (byte)Math.Min(255, predicted + step);
+                        predicted = ClampShort(predicted + curStep);
                     else
-                        predicted = (byte)Math.Max(0, predicted - step);
+                        predicted = ClampShort(predicted - curStep);
 
-                    audioResult.Add(predicted);
+                    audio.AddRange(BitConverter.GetBytes(predicted));
+                    produced++;
 
                     if (bit == previousBit)
-                        step = (short)Math.Min(maxStep, step * 2);
+                        curStep = Math.Min(maxStep, curStep * 2);
                     else
-                        step = (short)Math.Max(minStep, step / 2);
-
+                        curStep = Math.Max(minStep, curStep / 2);
                     previousBit = bit;
                 }
             }
 
-            byte[] finalResult = new byte[headerSize + audioResult.Count];
-            Array.Copy(header, 0, finalResult, 0, headerSize);
-            Array.Copy(audioResult.ToArray(), 0, finalResult, headerSize, audioResult.Count);
-            return finalResult;
+            return Concat(header, audio.ToArray());
         }
 
         // ============================================================
-        // Helper: قراءة WAV header size الصحيحة من الملف
+        // Helper: read the real WAV header size (offset of the audio data)
         // ============================================================
         private int GetWavHeaderSize(byte[] data)
         {
             // WAV file: "RIFF" + 4 bytes size + "WAVE" + chunks
-            // نبحث عن "data" chunk لنعرف وين تبدأ البيانات الصوتية
             if (data.Length < 12) return 0;
 
-            // تحقق أن الملف WAV
             if (data[0] != 'R' || data[1] != 'I' || data[2] != 'F' || data[3] != 'F') return 44;
             if (data[8] != 'W' || data[9] != 'A' || data[10] != 'V' || data[11] != 'E') return 44;
 
             int pos = 12;
             while (pos + 8 <= data.Length)
             {
-                // قراءة chunk ID
                 string chunkId = System.Text.Encoding.ASCII.GetString(data, pos, 4);
                 int chunkSize = BitConverter.ToInt32(data, pos + 4);
 
                 if (chunkId == "data")
-                    return pos + 8; // header ينتهي عند بداية data chunk data
+                    return pos + 8; // audio data starts right after the "data" chunk header
 
                 pos += 8 + chunkSize;
                 if (chunkSize % 2 != 0) pos++; // word alignment
@@ -1058,6 +1196,8 @@ namespace AudioCompressionProject
                 progressCompression.Invoke(new Action(() => UpdateProgress(percent)));
                 return;
             }
+            if (percent < 0) percent = 0;
+            if (percent > 100) percent = 100;
             progressCompression.Value = percent;
             lblProgressPercent.Text = percent + "%";
         }
@@ -1103,9 +1243,24 @@ namespace AudioCompressionProject
         private void Form1_DragDrop(object sender, DragEventArgs e)
         {
             string[] files = (string[])e.Data.GetData(DataFormats.FileDrop);
-            currentFile = files[0];
+            if (files == null || files.Length == 0) return;
+
+            string file = files[0];
+            if (!file.ToLower().EndsWith(".wav"))
+            {
+                MessageBox.Show("Please drop a WAV (.wav) file.");
+                return;
+            }
+
+            currentFile = file;
+            listBoxFiles.Items.Clear();
             listBoxFiles.Items.Add(currentFile);
             ShowAudioProperties(currentFile);
+        }
+
+        private void Form1_FormClosing(object sender, FormClosingEventArgs e)
+        {
+            StopPlayback();
         }
 
         private void btnExit_Click(object sender, EventArgs e)

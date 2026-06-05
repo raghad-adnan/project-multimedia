@@ -238,7 +238,7 @@ namespace AudioCompressionProject
             this.nudQuantizationLevels.ForeColor = System.Drawing.Color.White;
             this.nudQuantizationLevels.Minimum = 2;
             this.nudQuantizationLevels.Maximum = 256;
-            this.nudQuantizationLevels.Value = 16;
+            this.nudQuantizationLevels.Value = 256;
             this.nudQuantizationLevels.Increment = 2;
 
             this.grpCompressionSettings.Controls.Add(this.lblAlgorithmLabel);
